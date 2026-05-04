@@ -273,4 +273,8 @@ Output includes:
 
 Number of model parameters: 10788929
 
+step 0: train loss 4.3090, val loss 4.4709
+step 500: train loss 2.3985, val loss 2.0519
+step 1000: train loss 2.2654, val loss 1.7464
+step 1500: train loss 2.1689, val loss 1.6010
 """
