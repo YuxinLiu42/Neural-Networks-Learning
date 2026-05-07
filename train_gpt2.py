@@ -333,8 +333,12 @@ for step in range(max_steps):
         # addition of gradients corresponds to a SUM in the objective, but
         # instead of a SUM we want MEAN. Scale the loss here so it comes out right
         loss = loss / grad_accum_steps
-        loss_accm += loss.item()
+        loss_accm += loss.detach()
+        if ddp:
+            model.require_backward_grad_sync = (micro_step == grad_accum_steps - 1)
         loss.backward()
+    if ddp:
+        dist.all_reduce(loss_accm, op=dist.ReduceOp.AVG)
     norm = torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
     # determine and set the learning rate for this iteration
     lr = get_lr(step)
@@ -349,7 +353,11 @@ for step in range(max_steps):
     dt = (t1 - t0)*1000 # time difference in milliseconds
     tokens_processed = train_loader.B * train_loader.T * grad_accum_steps
     tokens_per_sec = tokens_processed / dt
-    print(f"step {step:4d} | loss {loss.item():.6f} | lr: {lr:.5f}| norm: {norm:.4f} | dt {dt:.2f}ms | token/sec: {tokens_per_sec:.2f}")
+    if master_process:
+        print(f"step {step:4d} | loss {loss.item():.6f} | lr: {lr:.5f}| norm: {norm:.4f} | dt {dt:.2f}ms | token/sec: {tokens_per_sec:.2f}")
+
+if ddp:
+    destroy_process_group()
 import sys; sys.exit(0)
 
 
