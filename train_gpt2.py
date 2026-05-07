@@ -17,6 +17,7 @@ class CausalSelfAttention(nn.Module):
         self.c_attn = nn.Linear(config.n_embd, 3 * config.n_embd)
         # output projection
         self.c_proj = nn.Linear(config.n_embd, config.n_embd)
+        self.c_proj.NANOGOT_SCALE_INIT = 1
         # regularization
         self.n_head = config.n_head
         self.n_embd = config.n_embd
@@ -47,6 +48,7 @@ class MLP(nn.Module):
         self.c_fc = nn.Linear(config.n_embd, 4 * config.n_embd)
         self.gelu = nn.GELU(approximate='tanh')
         self.c_proj = nn.Linear(4 * config.n_embd, config.n_embd)
+        self.c_proj.NANOGOT_SCALE_INIT = 1
         self.dropout = nn.Dropout(config.n_drop)
 
     def forward(self, x):
@@ -90,6 +92,23 @@ class GPT(nn.Module):
             ln_f = nn.LayerNorm(config.n_embd)
         ))
         self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=False)
+
+        # weight sharing scheme
+        self.transformer.wte.weight = self.lm_head.weight
+
+        # init params
+        self.apply(self._init_weights)
+
+    def _init_weights(self, module):
+        if isinstance(module, nn.Linear):
+            std = 0.02
+            if hasattr(module, 'NANOGOT_SCALE_INIT'):
+                std *= (2 * self.config.n_layer) ** -0.5
+            torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
+            if module.bias is not None:
+                torch.nn.init.zeros_(module.bias)
+        elif isinstance(module, nn.Embedding):
+            torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
 
     def forward(self, idx, targets=None):
         # idx is of shape (B, T)
@@ -161,6 +180,36 @@ class GPT(nn.Module):
 
         return model
 
+class DataLoaderLite:
+    def __init__(self, B, T):
+        self.B = B
+        self.T = T
+        import tiktoken
+        # at init load tokens from disk and store them in memory
+        with open('input.txt', 'r') as f:
+            text = f.read()
+        enc = tiktoken.get_encoding('gpt2')
+        tokens = enc.encode(text)
+        self.tokens = torch.tensor(tokens)
+        print(f"loaded {len(self.tokens)} tokens")
+        print(f'1 epoch = {len(self.tokens) // (B * T)} steps')
+
+        # state
+        self.current_position = 0
+
+    def next_batch(self):
+        B, T = self.B, self.T
+        buf = self.tokens[self.current_position: self.current_position + B * T + 1]
+        x = (buf[:-1]).view(B, T)  # inputs
+        y = (buf[1:]).view(B, T)  # targets
+        # advance the position in the tensor
+        self.current_position += B * T
+        # if loading the next batch would be out of bounds, advance to next shard
+        if self.current_position + (B * T + 1) > len(self.tokens):
+            self.current_position = 0
+        return x, y
+
+
 # -------------·------------------------------------------------------------
 device = 'cpu'
 if torch.cuda.is_available():
@@ -168,17 +217,12 @@ if torch.cuda.is_available():
 elif hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
     device = 'mps'
 print(f"using device: {device}")
-import tiktoken
-enc = tiktoken.get_encoding('gpt2')
-with open('input.txt', 'r') as f:
-    text = f.read()
-text = text[:1000]
-tokens = enc.encode(text)
 
-B, T = 4, 32
-buf = torch.tensor(tokens[:B*T+1]).to(device)
-x = buf[:-1].view(B, T)
-y = buf[1:].view(B, T)
+torch.manual_seed(1337)
+if torch.cuda.is_available():
+    torch.cuda.manual_seed_all(1337)
+
+train_loader = DataLoaderLite(B=4, T=32)
 
  # get logits
 model = GPT(GPTConfig())
@@ -186,8 +230,10 @@ model.to(device)
 # optimize:
 optimizer = torch.optim.AdamW(model.parameters(), lr=3e-4)
 for i in range(50):
-    logits, loss = model(x, y)
+    x, y = train_loader.next_batch()
+    x, y = x.to(device), y.to(device)
     optimizer.zero_grad(set_to_none=True)
+    logits, loss = model(x, y)
     loss.backward()
     optimizer.step()
     print(f"step {i}: loss {loss.item()}")
@@ -420,5 +466,169 @@ step 46: loss 6.423314094543457
 step 47: loss 5.509213447570801
 step 48: loss 6.094334602355957
 step 49: loss 5.915782451629639
+
+-------------·------------------------------------------------------------
+device = 'cpu'
+if torch.cuda.is_available():
+    device = 'cuda'
+elif hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
+    device = 'mps'
+print(f"using device: {device}")
+
+train_loader = DataLoaderLite(B=4, T=32)
+
+ # get logits
+model = GPT(GPTConfig())
+model.to(device)
+# optimize:
+optimizer = torch.optim.AdamW(model.parameters(), lr=3e-4)
+for i in range(50):
+    x, y = train_loader.next_batch()
+    x, y = x.to(device), y.to(device)
+    optimizer.zero_grad(set_to_none=True)
+    logits, loss = model(x, y)
+    loss.backward()
+    optimizer.step()
+    print(f"step {i}: loss {loss.item()}")
+import sys; sys.exit(0)
+
+Output:
+using device: mps
+loaded 338025 tokens
+1 epoch = 2640 steps
+step 0: loss 10.864021301269531
+step 1: loss 10.803430557250977
+step 2: loss 10.630294799804688
+step 3: loss 10.717875480651855
+step 4: loss 10.683014869689941
+step 5: loss 10.586713790893555
+step 6: loss 10.763566970825195
+step 7: loss 10.685805320739746
+step 8: loss 10.616341590881348
+step 9: loss 10.786633491516113
+step 10: loss 10.942501068115234
+step 11: loss 11.384876251220703
+step 12: loss 11.456494331359863
+step 13: loss 10.915283203125
+step 14: loss 10.046724319458008
+step 15: loss 10.026792526245117
+step 16: loss 10.738702774047852
+step 17: loss 10.902728080749512
+step 18: loss 10.724113464355469
+step 19: loss 10.49101734161377
+step 20: loss 10.306425094604492
+step 21: loss 10.11232852935791
+step 22: loss 9.63621997833252
+step 23: loss 9.576298713684082
+step 24: loss 9.701951026916504
+step 25: loss 9.427221298217773
+step 26: loss 9.324045181274414
+step 27: loss 9.534696578979492
+step 28: loss 9.237090110778809
+step 29: loss 9.26202392578125
+step 30: loss 9.052268981933594
+step 31: loss 9.098008155822754
+step 32: loss 9.120502471923828
+step 33: loss 9.182266235351562
+step 34: loss 9.62336540222168
+step 35: loss 9.702461242675781
+step 36: loss 9.955219268798828
+step 37: loss 11.520862579345703
+step 38: loss 12.656980514526367
+step 39: loss 13.009371757507324
+step 40: loss 13.127694129943848
+step 41: loss 13.251201629638672
+step 42: loss 12.92184829711914
+step 43: loss 12.607610702514648
+step 44: loss 9.894437789916992
+step 45: loss 8.75416088104248
+step 46: loss 10.551626205444336
+step 47: loss 14.082304000854492
+step 48: loss 13.911428451538086
+step 49: loss 14.107409477233887
+
+ -------------·------------------------------------------------------------
+# weight
+device = 'cpu'
+if torch.cuda.is_available():
+    device = 'cuda'
+elif hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
+    device = 'mps'
+print(f"using device: {device}")
+
+torch.manual_seed(1337)
+if torch.cuda.is_available():
+    torch.cuda.manual_seed_all(1337)
+
+train_loader = DataLoaderLite(B=4, T=32)
+
+ # get logits
+model = GPT(GPTConfig())
+model.to(device)
+# optimize:
+optimizer = torch.optim.AdamW(model.parameters(), lr=3e-4)
+for i in range(50):
+    x, y = train_loader.next_batch()
+    x, y = x.to(device), y.to(device)
+    optimizer.zero_grad(set_to_none=True)
+    logits, loss = model(x, y)
+    loss.backward()
+    optimizer.step()
+    print(f"step {i}: loss {loss.item()}")
+import sys; sys.exit(0)
+
+Output: using device: mps
+loaded 338025 tokens
+1 epoch = 2640 steps
+step 0: loss 10.958171844482422
+step 1: loss 9.881328582763672
+step 2: loss 10.094736099243164
+step 3: loss 9.937455177307129
+step 4: loss 9.89342212677002
+step 5: loss 9.924232482910156
+step 6: loss 10.593067169189453
+step 7: loss 10.743429183959961
+step 8: loss 10.259727478027344
+step 9: loss 9.899251937866211
+step 10: loss 9.92605209350586
+step 11: loss 9.431317329406738
+step 12: loss 9.641067504882812
+step 13: loss 9.558398246765137
+step 14: loss 9.58387565612793
+step 15: loss 9.670307159423828
+step 16: loss 9.95462417602539
+step 17: loss 10.57908821105957
+step 18: loss 9.358396530151367
+step 19: loss 9.18147087097168
+step 20: loss 9.006112098693848
+step 21: loss 9.068843841552734
+step 22: loss 8.474428176879883
+step 23: loss 8.566959381103516
+step 24: loss 8.511438369750977
+step 25: loss 8.470565795898438
+step 26: loss 8.51710319519043
+step 27: loss 8.652408599853516
+step 28: loss 8.49587631225586
+step 29: loss 8.569062232971191
+step 30: loss 8.449703216552734
+step 31: loss 8.607945442199707
+step 32: loss 8.780381202697754
+step 33: loss 8.738457679748535
+step 34: loss 9.068102836608887
+step 35: loss 9.021249771118164
+step 36: loss 9.043392181396484
+step 37: loss 9.000631332397461
+step 38: loss 9.086548805236816
+step 39: loss 9.039274215698242
+step 40: loss 9.257291793823242
+step 41: loss 8.698537826538086
+step 42: loss 8.585567474365234
+step 43: loss 8.55419921875
+step 44: loss 8.297470092773438
+step 45: loss 8.523971557617188
+step 46: loss 8.224993705749512
+step 47: loss 8.29050064086914
+step 48: loss 8.226791381835938
+step 49: loss 8.209710121154785
 
 """
