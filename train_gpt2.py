@@ -186,11 +186,37 @@ class GPT(nn.Module):
 
         return model
 
+    def configure_optimizers(self, weight_decay, learning_rate, device):
+        # start with all of the candidate parameters (that require grad)
+        param_dict = {pn: p for pn, p in self.named_parameters()}
+        param_dict = {pn: p for pn, p in param_dict.items() if p.requires_grad}
+        # create optim groups. Any parameters that is 2D will be weight decayed, otherwise no.
+        # i.e. all weight tensors in matmuls + embeddings decay, all biases and layernorms don't.
+        decay_params = [p for n, p in param_dict.items() if p.dim() >= 2]
+        nodecay_params = [p for n, p in param_dict.items() if p.dim() < 2]
+        optim_groups = [
+            {'params': decay_params, 'weight_decay': weight_decay},
+            {'params': nodecay_params, 'weight_decay': 0.0}
+        ]
+        num_decay_params = sum(p.numel() for p in decay_params)
+        num_nodecay_params = sum(p.numel() for p in nodecay_params)
+        print(f"num decayed parameter tensors: {len(decay_params)}, with {num_decay_params:,} parameters")
+        print(f"num non-decayed parameter tensors: {len(nodecay_params)}, with {num_nodecay_params:,} parameters")
+        # Create AdamW optimizer and use the fused version if it is available
+        fused_available = 'fused' in inspect.signature(torch.optim.AdamW).parameters
+        use_fused = fused_available and "cuda" in device
+        print(f"using fused AdamW: {use_fused}")
+        optimizer = torch.optim.AdamW(optim_groups, lr=learning_rate, betas=(0.9, 0.95), eps=1e-8, fused=use_fused)
+        return optimizer
+
+import tiktoken
 class DataLoaderLite:
-    def __init__(self, B, T):
+    def __init__(self, B, T, process_rank, num_processes):
         self.B = B
         self.T = T
-        import tiktoken
+        self.process_rank = process_rank
+        self.num_processes = num_processes
+
         # at init load tokens from disk and store them in memory
         with open('input.txt', 'r') as f:
             text = f.read()
@@ -201,7 +227,7 @@ class DataLoaderLite:
         print(f'1 epoch = {len(self.tokens) // (B * T)} steps')
 
         # state
-        self.current_position = 0
+        self.current_position = self.B * self.T * self.process_rank
 
     def next_batch(self):
         B, T = self.B, self.T
@@ -209,45 +235,111 @@ class DataLoaderLite:
         x = (buf[:-1]).view(B, T)  # inputs
         y = (buf[1:]).view(B, T)  # targets
         # advance the position in the tensor
-        self.current_position += B * T
+        self.current_position += B * T * self.num_processes
         # if loading the next batch would be out of bounds, advance to next shard
-        if self.current_position + (B * T + 1) > len(self.tokens):
-            self.current_position = 0
+        if self.current_position + (B * T * self.num_processes + 1) > len(self.tokens):
+            self.current_position = self.B * self.T * self.process_rank
         return x, y
 
 
 # ----------------------------------------------------------
-device = 'cpu'
-if torch.cuda.is_available():
-    device = 'cuda'
-elif hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
-    device = 'mps'
-print(f"using device: {device}")
+# run the training loop
+from torch.distributed import init_process_group, destroy_process_group
+from torch.nn.parallel import DistributedDataParallel as DDP
+import torch.distributed as dist
+
+# set up DDP (distributed data parallel).
+# torchrun command sets the env variables RANK, LOCAL_RANK, and WORLD_SIZE
+ddp = int(os.environ.get('RANK', -1)) != -1 # is this a ddp run?
+if ddp:
+    # use of DDP atm demands CUDA, we set the device appropriately according to rank
+    assert torch.cuda.is_available(), "for now i think we need CUDA for DDP"
+    init_process_group(backend='nccl')
+    ddp_rank = int(os.environ['RANK'])
+    ddp_local_rank = int(os.environ['LOCAL_RANK'])
+    ddp_world_size = int(os.environ['WORLD_SIZE'])
+    device = f'cuda:{ddp_local_rank}'
+    torch.cuda.set_device(device)
+    master_process = ddp_rank == 0 # this process will do logging, checkpointing etc.
+else:
+    # vanilla, non-DDP run
+    ddp_rank = 0
+    ddp_local_rank = 0
+    ddp_world_size = 1
+    master_process = True
+    # attempt to autodetect device
+    device = "cpu"
+    if torch.cuda.is_available():
+        device = "cuda"
+    elif hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
+        device = "mps"
+    print(f"using device: {device}")
+
 
 torch.manual_seed(1337)
 if torch.cuda.is_available():
     torch.cuda.manual_seed_all(1337)
 
-train_loader = DataLoaderLite(B=4, T=32)
+total_batch_size = 524288 # 2**19
+B = 4 # micro batch size
+T = 32 # sequence length
+assert total_batch_size % (B * T) == 0, "make sure that the total batch size is divisible by B * T * ddp_world_size"
+grad_accum_steps = total_batch_size // (B * T) * ddp_world_size
+if master_process:
+    print(f"total batch size: {total_batch_size}")
+    print(f"=> calculated gradient accumlation steps: {grad_accum_steps}")
+
+train_loader = DataLoaderLite(B=B, T=T, process_rank=ddp_rank, world_size=ddp_world_size)
 torch.set_float32_matmul_precision('high')
 
  # get logits
 model = GPT(GPTConfig(vocab_size=50304))
 model.to(device)
 # model = torch.compile(model) cannot in mps
+if ddp:
+    model = DDP(model, device_ids=[ddp_local_rank])
 
+max_lr = 3e-4
+min_lr = max_lr * 0.1
+wramup_steps = 10
+max_steps = 50
+def get_lr(it):
+    # 1) linear warmup for the first warmup_steps
+    if it < wramup_steps:
+        return max_lr * (it + 1) / wramup_steps
+    # 2) if it > lr_decay_iters, return min_lr
+    if it > max_steps:
+        return min_lr
+    # 3) in between, use cosine decay down to min_lr
+    decay_ratio = (it - wramup_steps) / (max_steps - wramup_steps)
+    assert 0 <= decay_ratio <= 1
+    coeff = 0.5 * (1.0 + math.cos(math.pi * decay_ratio))  # coeff ranges 0..1
+    return min_lr + coeff * (max_lr - min_lr)
 
 # optimize:
-optimizer = torch.optim.AdamW(model.parameters(), lr=3e-4, betas=(0.9, 0.95), eps=1e-8)
-for i in range(50):
+# ptimizer = torch.optim.AdamW(model.parameters(), lr=3e-4, betas=(0.9, 0.95), eps=1e-8)
+optimizer = model.configure_optimizers(weight_decay=0.1, learning_rate=6e-4, device=device)
+for step in range(max_steps):
     t0 = time.time()
-    x, y = train_loader.next_batch()
-    x, y = x.to(device), y.to(device)
-    optimizer.zero_grad(set_to_none=True)
-    with torch.autocast(device_type=device, dtype=torch.bfloat16):
-        logits, loss = model(x, y)
-    loss.backward()
+    optimizer.zero_grad()
+    loss_accm = 0.0
+    for micro_step in range(grad_accum_steps):
+        x, y = train_loader.next_batch()
+        x, y = x.to(device), y.to(device)
+        with torch.autocast(device_type=device, dtype=torch.bfloat16):
+            logits, loss = model(x, y)
+        # we have to scale the loss to account for gradient accumulation,
+        # because the gradients just add on each successive backward().
+        # addition of gradients corresponds to a SUM in the objective, but
+        # instead of a SUM we want MEAN. Scale the loss here so it comes out right
+        loss = loss / grad_accum_steps
+        loss_accm += loss.item()
+        loss.backward()
     norm = torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+    # determine and set the learning rate for this iteration
+    lr = get_lr(step)
+    for param_group in optimizer.param_groups:
+        param_group['lr'] = lr
     optimizer.step()
     if device == "mps":
         torch.mps.synchronize()
@@ -255,8 +347,9 @@ for i in range(50):
         torch.cuda.synchronize()
     t1 = time.time()
     dt = (t1 - t0)*1000 # time difference in milliseconds
-    tokens_pre_sec = (train_loader.B * train_loader.T) / (t1 - t0)
-    print(f"step {i:4d} | loss {loss.item():.6f} | norm: {norm:.4f} | dt {dt:.2f}ms | token/sec: {tokens_pre_sec: .2f}")
+    tokens_processed = train_loader.B * train_loader.T * grad_accum_steps
+    tokens_per_sec = tokens_processed / dt
+    print(f"step {step:4d} | loss {loss.item():.6f} | lr: {lr:.5f}| norm: {norm:.4f} | dt {dt:.2f}ms | token/sec: {tokens_per_sec:.2f}")
 import sys; sys.exit(0)
 
 
@@ -1335,4 +1428,385 @@ step   47 | loss 6.166870 | norm: 3.5953 | dt 399.34ms | token/sec:  320.53
 step   48 | loss 6.833191 | norm: 3.4541 | dt 334.32ms | token/sec:  382.87
 step   49 | loss 6.729462 | norm: 2.9496 | dt 324.92ms | token/sec:  393.94
 
+# ----------------------------------------------------------
+device = 'cpu'
+if torch.cuda.is_available():
+    device = 'cuda'
+elif hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
+    device = 'mps'
+print(f"using device: {device}")
+
+torch.manual_seed(1337)
+if torch.cuda.is_available():
+    torch.cuda.manual_seed_all(1337)
+
+train_loader = DataLoaderLite(B=4, T=32)
+torch.set_float32_matmul_precision('high')
+
+ # get logits
+model = GPT(GPTConfig(vocab_size=50304))
+model.to(device)
+# model = torch.compile(model) cannot in mps
+
+max_lr = 3e-4
+min_lr = max_lr * 0.1
+wramup_steps = 10
+max_steps = 50
+def get_lr(it):
+    # 1) linear warmup for the first warmup_steps
+    if it < wramup_steps:
+        return max_lr * (it + 1) / wramup_steps
+    # 2) if it > lr_decay_iters, return min_lr
+    if it > max_steps:
+        return min_lr
+    # 3) in between, use cosine decay down to min_lr
+    decay_ratio = (it - wramup_steps) / (max_steps - wramup_steps)
+    assert 0 <= decay_ratio <= 1
+    coeff = 0.5 * (1.0 + math.cos(math.pi * decay_ratio))  # coeff ranges 0..1
+    return min_lr + coeff * (max_lr - min_lr)
+
+# optimize:
+optimizer = torch.optim.AdamW(model.parameters(), lr=3e-4, betas=(0.9, 0.95), eps=1e-8)
+for step in range(50):
+    t0 = time.time()
+    x, y = train_loader.next_batch()
+    x, y = x.to(device), y.to(device)
+    optimizer.zero_grad(set_to_none=True)
+    with torch.autocast(device_type=device, dtype=torch.bfloat16):
+        logits, loss = model(x, y)
+    loss.backward()
+    norm = torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+    # determine and set the learning rate for this iteration
+    lr = get_lr(step)
+    for param_group in optimizer.param_groups:
+        param_group['lr'] = lr
+    optimizer.step()
+    if device == "mps":
+        torch.mps.synchronize()
+    elif device == "cuda":
+        torch.cuda.synchronize()
+    t1 = time.time()
+    dt = (t1 - t0)*1000 # time difference in milliseconds
+    tokens_pre_sec = (train_loader.B * train_loader.T) / (t1 - t0)
+    print(f"step {step:4d} | loss {loss.item():.6f} | lr: {lr:.5f}| norm: {norm:.4f} | dt {dt:.2f}ms | token/sec: {tokens_pre_sec: .2f}")
+import sys; sys.exit(0)
+
+Output:
+using device: mps
+loaded 338025 tokens
+1 epoch = 2640 steps
+step    0 | loss 10.978027 | lr: 0.00003| norm: 15.5521 | dt 1119.66ms | token/sec:  114.32
+step    1 | loss 10.433594 | lr: 0.00006| norm: 9.6453 | dt 382.50ms | token/sec:  334.64
+step    2 | loss 9.472168 | lr: 0.00009| norm: 7.6970 | dt 290.59ms | token/sec:  440.48
+step    3 | loss 9.621826 | lr: 0.00012| norm: 5.7578 | dt 287.92ms | token/sec:  444.57
+step    4 | loss 9.066895 | lr: 0.00015| norm: 5.4889 | dt 287.94ms | token/sec:  444.54
+step    5 | loss 8.865967 | lr: 0.00018| norm: 4.5996 | dt 286.33ms | token/sec:  447.04
+step    6 | loss 9.487488 | lr: 0.00021| norm: 4.5104 | dt 295.82ms | token/sec:  432.69
+step    7 | loss 9.274414 | lr: 0.00024| norm: 3.7818 | dt 296.65ms | token/sec:  431.48
+step    8 | loss 8.660645 | lr: 0.00027| norm: 4.6259 | dt 297.71ms | token/sec:  429.95
+step    9 | loss 8.451660 | lr: 0.00030| norm: 4.0346 | dt 291.53ms | token/sec:  439.06
+step   10 | loss 8.752319 | lr: 0.00030| norm: 3.1268 | dt 300.32ms | token/sec:  426.21
+step   11 | loss 7.856934 | lr: 0.00030| norm: 3.4747 | dt 296.22ms | token/sec:  432.12
+step   12 | loss 8.175659 | lr: 0.00030| norm: 3.1097 | dt 312.10ms | token/sec:  410.12
+step   13 | loss 7.850830 | lr: 0.00030| norm: 3.3040 | dt 288.22ms | token/sec:  444.10
+step   14 | loss 7.886841 | lr: 0.00029| norm: 2.8674 | dt 288.61ms | token/sec:  443.51
+step   15 | loss 7.782104 | lr: 0.00029| norm: 2.7492 | dt 287.88ms | token/sec:  444.63
+step   16 | loss 7.626099 | lr: 0.00029| norm: 3.2068 | dt 288.24ms | token/sec:  444.07
+step   17 | loss 8.395508 | lr: 0.00028| norm: 2.8627 | dt 289.02ms | token/sec:  442.88
+step   18 | loss 7.390869 | lr: 0.00027| norm: 2.5230 | dt 290.08ms | token/sec:  441.26
+step   19 | loss 7.983337 | lr: 0.00027| norm: 3.0352 | dt 291.54ms | token/sec:  439.05
+step   20 | loss 7.576782 | lr: 0.00026| norm: 3.0521 | dt 290.97ms | token/sec:  439.91
+step   21 | loss 7.824951 | lr: 0.00025| norm: 2.9743 | dt 297.90ms | token/sec:  429.67
+step   22 | loss 6.553589 | lr: 0.00024| norm: 3.2653 | dt 302.75ms | token/sec:  422.79
+step   23 | loss 6.926270 | lr: 0.00024| norm: 2.5441 | dt 296.56ms | token/sec:  431.62
+step   24 | loss 6.969482 | lr: 0.00023| norm: 2.5422 | dt 307.42ms | token/sec:  416.37
+step   25 | loss 6.763062 | lr: 0.00022| norm: 2.8249 | dt 309.32ms | token/sec:  413.81
+step   26 | loss 6.748291 | lr: 0.00021| norm: 2.8813 | dt 332.60ms | token/sec:  384.85
+step   27 | loss 7.601135 | lr: 0.00020| norm: 3.0752 | dt 303.32ms | token/sec:  422.00
+step   28 | loss 7.159058 | lr: 0.00019| norm: 3.5002 | dt 313.08ms | token/sec:  408.85
+step   29 | loss 7.009949 | lr: 0.00018| norm: 2.8170 | dt 313.75ms | token/sec:  407.97
+step   30 | loss 7.018433 | lr: 0.00016| norm: 3.7048 | dt 303.61ms | token/sec:  421.60
+step   31 | loss 7.326660 | lr: 0.00015| norm: 2.9146 | dt 310.09ms | token/sec:  412.78
+step   32 | loss 7.210327 | lr: 0.00014| norm: 2.7601 | dt 305.78ms | token/sec:  418.61
+step   33 | loss 7.052490 | lr: 0.00013| norm: 3.4114 | dt 303.42ms | token/sec:  421.86
+step   34 | loss 7.885132 | lr: 0.00012| norm: 3.1001 | dt 319.54ms | token/sec:  400.58
+step   35 | loss 7.875610 | lr: 0.00011| norm: 2.8943 | dt 311.83ms | token/sec:  410.49
+step   36 | loss 7.643555 | lr: 0.00010| norm: 2.6479 | dt 303.75ms | token/sec:  421.40
+step   37 | loss 7.719116 | lr: 0.00009| norm: 2.8450 | dt 315.10ms | token/sec:  406.22
+step   38 | loss 8.095825 | lr: 0.00009| norm: 3.3608 | dt 310.96ms | token/sec:  411.63
+step   39 | loss 7.528687 | lr: 0.00008| norm: 2.7705 | dt 305.26ms | token/sec:  419.32
+step   40 | loss 7.508301 | lr: 0.00007| norm: 3.1289 | dt 309.12ms | token/sec:  414.08
+step   41 | loss 7.199829 | lr: 0.00006| norm: 3.3694 | dt 303.31ms | token/sec:  422.01
+step   42 | loss 7.356689 | lr: 0.00006| norm: 2.9233 | dt 306.33ms | token/sec:  417.84
+step   43 | loss 7.323669 | lr: 0.00005| norm: 2.5982 | dt 305.92ms | token/sec:  418.40
+step   44 | loss 7.477661 | lr: 0.00004| norm: 2.4761 | dt 302.31ms | token/sec:  423.40
+step   45 | loss 7.406067 | lr: 0.00004| norm: 2.7719 | dt 317.11ms | token/sec:  403.64
+step   46 | loss 6.424133 | lr: 0.00004| norm: 3.1812 | dt 299.45ms | token/sec:  427.45
+step   47 | loss 6.303467 | lr: 0.00003| norm: 3.1112 | dt 355.31ms | token/sec:  360.25
+step   48 | loss 7.082397 | lr: 0.00003| norm: 3.1034 | dt 335.18ms | token/sec:  381.88
+step   49 | loss 6.990479 | lr: 0.00003| norm: 2.4505 | dt 307.08ms | token/sec:  416.83
+
+# ----------------------------------------------------------
+device = 'cpu'
+if torch.cuda.is_available():
+    device = 'cuda'
+elif hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
+    device = 'mps'
+print(f"using device: {device}")
+
+torch.manual_seed(1337)
+if torch.cuda.is_available():
+    torch.cuda.manual_seed_all(1337)
+
+train_loader = DataLoaderLite(B=4, T=32)
+torch.set_float32_matmul_precision('high')
+
+ # get logits
+model = GPT(GPTConfig(vocab_size=50304))
+model.to(device)
+# model = torch.compile(model) cannot in mps
+
+max_lr = 3e-4
+min_lr = max_lr * 0.1
+wramup_steps = 10
+max_steps = 50
+def get_lr(it):
+    # 1) linear warmup for the first warmup_steps
+    if it < wramup_steps:
+        return max_lr * (it + 1) / wramup_steps
+    # 2) if it > lr_decay_iters, return min_lr
+    if it > max_steps:
+        return min_lr
+    # 3) in between, use cosine decay down to min_lr
+    decay_ratio = (it - wramup_steps) / (max_steps - wramup_steps)
+    assert 0 <= decay_ratio <= 1
+    coeff = 0.5 * (1.0 + math.cos(math.pi * decay_ratio))  # coeff ranges 0..1
+    return min_lr + coeff * (max_lr - min_lr)
+
+# optimize:
+# ptimizer = torch.optim.AdamW(model.parameters(), lr=3e-4, betas=(0.9, 0.95), eps=1e-8)
+optimizer = model.configure_optimizers(weight_decay=0.1, learning_rate=6e-4, device=device)
+for step in range(50):
+    t0 = time.time()
+    x, y = train_loader.next_batch()
+    x, y = x.to(device), y.to(device)
+    optimizer.zero_grad(set_to_none=True)
+    with torch.autocast(device_type=device, dtype=torch.bfloat16):
+        logits, loss = model(x, y)
+    loss.backward()
+    norm = torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+    # determine and set the learning rate for this iteration
+    lr = get_lr(step)
+    for param_group in optimizer.param_groups:
+        param_group['lr'] = lr
+    optimizer.step()
+    if device == "mps":
+        torch.mps.synchronize()
+    elif device == "cuda":
+        torch.cuda.synchronize()
+    t1 = time.time()
+    dt = (t1 - t0)*1000 # time difference in milliseconds
+    tokens_pre_sec = (train_loader.B * train_loader.T) / (t1 - t0)
+    print(f"step {step:4d} | loss {loss.item():.6f} | lr: {lr:.5f}| norm: {norm:.4f} | dt {dt:.2f}ms | token/sec: {tokens_pre_sec: .2f}")
+import sys; sys.exit(0)
+
+using device: mps
+loaded 338025 tokens
+1 epoch = 2640 steps
+num decayed parameter tensors: 50, with 124,354,560 parameters
+num non-decayed parameter tensors: 98, with 121,344 parameters
+using fused AdamW: False
+step    0 | loss 10.978027 | lr: 0.00003| norm: 15.5521 | dt 2596.28ms | token/sec:  49.30
+step    1 | loss 10.433105 | lr: 0.00006| norm: 9.6456 | dt 448.23ms | token/sec:  285.57
+step    2 | loss 9.471436 | lr: 0.00009| norm: 7.6947 | dt 307.98ms | token/sec:  415.61
+step    3 | loss 9.623657 | lr: 0.00012| norm: 5.7578 | dt 295.58ms | token/sec:  433.05
+step    4 | loss 9.065918 | lr: 0.00015| norm: 5.4889 | dt 289.39ms | token/sec:  442.31
+step    5 | loss 8.866455 | lr: 0.00018| norm: 4.5997 | dt 291.72ms | token/sec:  438.77
+step    6 | loss 9.487732 | lr: 0.00021| norm: 4.5102 | dt 289.72ms | token/sec:  441.81
+step    7 | loss 9.273438 | lr: 0.00024| norm: 3.7821 | dt 287.48ms | token/sec:  445.25
+step    8 | loss 8.660889 | lr: 0.00027| norm: 4.6234 | dt 289.67ms | token/sec:  441.88
+step    9 | loss 8.451416 | lr: 0.00030| norm: 4.0353 | dt 289.23ms | token/sec:  442.55
+step   10 | loss 8.752319 | lr: 0.00030| norm: 3.1268 | dt 289.67ms | token/sec:  441.88
+step   11 | loss 7.859253 | lr: 0.00030| norm: 3.4749 | dt 287.18ms | token/sec:  445.72
+step   12 | loss 8.176392 | lr: 0.00030| norm: 3.1138 | dt 287.70ms | token/sec:  444.91
+step   13 | loss 7.851074 | lr: 0.00030| norm: 3.3047 | dt 286.86ms | token/sec:  446.21
+step   14 | loss 7.887329 | lr: 0.00029| norm: 2.8689 | dt 294.18ms | token/sec:  435.11
+step   15 | loss 7.783325 | lr: 0.00029| norm: 2.7519 | dt 290.84ms | token/sec:  440.11
+step   16 | loss 7.625122 | lr: 0.00029| norm: 3.2080 | dt 287.18ms | token/sec:  445.72
+step   17 | loss 8.395508 | lr: 0.00028| norm: 2.8614 | dt 289.90ms | token/sec:  441.53
+step   18 | loss 7.390991 | lr: 0.00027| norm: 2.5240 | dt 292.13ms | token/sec:  438.16
+step   19 | loss 7.983337 | lr: 0.00027| norm: 3.0354 | dt 293.53ms | token/sec:  436.08
+step   20 | loss 7.576294 | lr: 0.00026| norm: 3.0502 | dt 287.88ms | token/sec:  444.64
+step   21 | loss 7.826416 | lr: 0.00025| norm: 2.9742 | dt 288.02ms | token/sec:  444.42
+step   22 | loss 6.552124 | lr: 0.00024| norm: 3.2635 | dt 285.25ms | token/sec:  448.73
+step   23 | loss 6.926880 | lr: 0.00024| norm: 2.5436 | dt 299.21ms | token/sec:  427.79
+step   24 | loss 6.969116 | lr: 0.00023| norm: 2.5428 | dt 290.01ms | token/sec:  441.36
+step   25 | loss 6.762756 | lr: 0.00022| norm: 2.8246 | dt 290.77ms | token/sec:  440.22
+step   26 | loss 6.749329 | lr: 0.00021| norm: 2.8821 | dt 296.34ms | token/sec:  431.93
+step   27 | loss 7.601440 | lr: 0.00020| norm: 3.0693 | dt 291.58ms | token/sec:  438.99
+step   28 | loss 7.159729 | lr: 0.00019| norm: 3.4954 | dt 292.20ms | token/sec:  438.06
+step   29 | loss 7.010986 | lr: 0.00018| norm: 2.8136 | dt 305.18ms | token/sec:  419.43
+step   30 | loss 7.018433 | lr: 0.00016| norm: 3.6980 | dt 417.10ms | token/sec:  306.88
+step   31 | loss 7.325500 | lr: 0.00015| norm: 2.9104 | dt 329.57ms | token/sec:  388.38
+step   32 | loss 7.211914 | lr: 0.00014| norm: 2.7585 | dt 309.03ms | token/sec:  414.20
+step   33 | loss 7.052979 | lr: 0.00013| norm: 3.4087 | dt 295.61ms | token/sec:  433.01
+step   34 | loss 7.885132 | lr: 0.00012| norm: 3.0995 | dt 297.90ms | token/sec:  429.68
+step   35 | loss 7.875122 | lr: 0.00011| norm: 2.8935 | dt 294.02ms | token/sec:  435.35
+step   36 | loss 7.643677 | lr: 0.00010| norm: 2.6480 | dt 294.32ms | token/sec:  434.91
+step   37 | loss 7.718384 | lr: 0.00009| norm: 2.8444 | dt 288.42ms | token/sec:  443.80
+step   38 | loss 8.095093 | lr: 0.00009| norm: 3.3620 | dt 289.39ms | token/sec:  442.31
+step   39 | loss 7.527710 | lr: 0.00008| norm: 2.7725 | dt 301.93ms | token/sec:  423.94
+step   40 | loss 7.508545 | lr: 0.00007| norm: 3.1298 | dt 289.16ms | token/sec:  442.67
+step   41 | loss 7.200806 | lr: 0.00006| norm: 3.3752 | dt 288.56ms | token/sec:  443.59
+step   42 | loss 7.355896 | lr: 0.00006| norm: 2.9257 | dt 286.22ms | token/sec:  447.21
+step   43 | loss 7.324951 | lr: 0.00005| norm: 2.5981 | dt 287.69ms | token/sec:  444.92
+step   44 | loss 7.477478 | lr: 0.00004| norm: 2.4762 | dt 286.75ms | token/sec:  446.39
+step   45 | loss 7.407166 | lr: 0.00004| norm: 2.7713 | dt 285.59ms | token/sec:  448.20
+step   46 | loss 6.423157 | lr: 0.00004| norm: 3.1820 | dt 298.74ms | token/sec:  428.47
+step   47 | loss 6.303833 | lr: 0.00003| norm: 3.1159 | dt 286.84ms | token/sec:  446.24
+step   48 | loss 7.082886 | lr: 0.00003| norm: 3.1025 | dt 286.32ms | token/sec:  447.05
+step   49 | loss 6.990112 | lr: 0.00003| norm: 2.4500 | dt 288.50ms | token/sec:  443.67
+
+# ----------------------------------------------------------
+device = 'cpu'
+if torch.cuda.is_available():
+    device = 'cuda'
+elif hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
+    device = 'mps'
+print(f"using device: {device}")
+
+torch.manual_seed(1337)
+if torch.cuda.is_available():
+    torch.cuda.manual_seed_all(1337)
+
+total_batch_size = 524288 # 2**19
+B = 4 # micro batch size
+T = 32 # sequence length
+assert total_batch_size % (B * T) == 0, "make sure that the total batch size is divisible by B * T"
+grad_accum_steps = total_batch_size // (B * T)
+print(f"total batch size: {total_batch_size}")
+print(f"=> calculated gradient accumlation steps: {grad_accum_steps}")
+
+train_loader = DataLoaderLite(B=B, T=T)
+torch.set_float32_matmul_precision('high')
+
+ # get logits
+model = GPT(GPTConfig(vocab_size=50304))
+model.to(device)
+# model = torch.compile(model) cannot in mps
+
+max_lr = 3e-4
+min_lr = max_lr * 0.1
+wramup_steps = 10
+max_steps = 50
+def get_lr(it):
+    # 1) linear warmup for the first warmup_steps
+    if it < wramup_steps:
+        return max_lr * (it + 1) / wramup_steps
+    # 2) if it > lr_decay_iters, return min_lr
+    if it > max_steps:
+        return min_lr
+    # 3) in between, use cosine decay down to min_lr
+    decay_ratio = (it - wramup_steps) / (max_steps - wramup_steps)
+    assert 0 <= decay_ratio <= 1
+    coeff = 0.5 * (1.0 + math.cos(math.pi * decay_ratio))  # coeff ranges 0..1
+    return min_lr + coeff * (max_lr - min_lr)
+
+# optimize:
+# ptimizer = torch.optim.AdamW(model.parameters(), lr=3e-4, betas=(0.9, 0.95), eps=1e-8)
+optimizer = model.configure_optimizers(weight_decay=0.1, learning_rate=6e-4, device=device)
+for step in range(max_steps):
+    t0 = time.time()
+    optimizer.zero_grad()
+    loss_accm = 0.0
+    for micro_step in range(grad_accum_steps):
+        x, y = train_loader.next_batch()
+        x, y = x.to(device), y.to(device)
+        with torch.autocast(device_type=device, dtype=torch.bfloat16):
+            logits, loss = model(x, y)
+        # we have to scale the loss to account for gradient accumulation,
+        # because the gradients just add on each successive backward().
+        # addition of gradients corresponds to a SUM in the objective, but
+        # instead of a SUM we want MEAN. Scale the loss here so it comes out right
+        loss = loss / grad_accum_steps
+        loss_accm += loss.item()
+        loss.backward()
+    norm = torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+    # determine and set the learning rate for this iteration
+    lr = get_lr(step)
+    for param_group in optimizer.param_groups:
+        param_group['lr'] = lr
+    optimizer.step()
+    if device == "mps":
+        torch.mps.synchronize()
+    elif device == "cuda":
+        torch.cuda.synchronize()
+    t1 = time.time()
+    dt = (t1 - t0)*1000 # time difference in milliseconds
+    tokens_processed = train_loader.B * train_loader.T * grad_accum_steps
+    tokens_per_sec = tokens_processed / dt
+    print(f"step {step:4d} | loss {loss.item():.6f} | lr: {lr:.5f}| norm: {norm:.4f} | dt {dt:.2f}ms | token/sec: {tokens_pre_sec: .2f}")
+import sys; sys.exit(0)
+
+Output:
+using device: mps
+total batch size: 524288
+=> calculated gradient accumlation steps: 4096
+loaded 338025 tokens
+1 epoch = 2640 steps
+num decayed parameter tensors: 50, with 124,354,560 parameters
+num non-decayed parameter tensors: 98, with 121,344 parameters
+using fused AdamW: False
+
+# ----------------------------------------------------------
+# torchrun --standalone --nproc_per_node=8 train_gpt2.py
+# run the training loop
+from torch.distributed import init_process_group, destroy_process_group
+
+# set up DDP (distributed data parallel).
+# torchrun command sets the env variables RANK, LOCAL_RANK, and WORLD_SIZE
+ddp = int(os.environ.get('RANK', -1)) != -1 # is this a ddp run?
+if ddp:
+    # use of DDP atm demands CUDA, we set the device appropriately according to rank
+    assert torch.cuda.is_available(), "for now i think we need CUDA for DDP"
+    init_process_group(backend='nccl')
+    ddp_rank = int(os.environ['RANK'])
+    ddp_local_rank = int(os.environ['LOCAL_RANK'])
+    ddp_world_size = int(os.environ['WORLD_SIZE'])
+    device = f'cuda:{ddp_local_rank}'
+    torch.cuda.set_device(device)
+    master_process = ddp_rank == 0 # this process will do logging, checkpointing etc.
+else:
+    # vanilla, non-DDP run
+    ddp_rank = 0
+    ddp_local_rank = 0
+    ddp_world_size = 1
+    master_process = True
+    # attempt to autodetect device
+    device = "cpu"
+    if torch.cuda.is_available():
+        device = "cuda"
+    elif hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
+        device = "mps"
+    print(f"using device: {device}")
+
+
+torch.manual_seed(1337)
+if torch.cuda.is_available():
+    torch.cuda.manual_seed_all(1337)
+
+total_batch_size = 524288 # 2**19
+B = 4 # micro batch size
+T = 32 # sequence length
+assert total_batch_size % (B * T) == 0, "make sure that the total batch size is divisible by B * T * ddp_world_size"
+grad_accum_steps = total_batch_size // (B * T) * ddp_world_size
+if master_process:
+    print(f"total batch size: {total_batch_size}")
+    print(f"=> calculated gradient accumlation steps: {grad_accum_steps}")
+
+print("I am GPU", ddp_rank)
+print("Bye")
+import sys; sys.exit(0)
+
+# fail because of no GPUs, but the code is correct and ready to run in a multi-GPU environment with torchrun.
 """
