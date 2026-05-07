@@ -33,14 +33,20 @@ class CausalSelfAttention(nn.Module):
         k = k.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
         q = q.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
         v = v.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
-        att = (q @ k.transpose(-2, -1)) * (1.0 / math.sqrt(k.size(-1)))
-        att = att.masked_fill(self.bias[:, :, :T, :T] == 0, float('-inf'))
-        att = F.softmax(att, dim=-1)
-        y = att @ v  # (B, nh, T, T) x (B, nh, T, hs) -> (B, nh, T, hs)
+
+        # att = (q @ k.transpose(-2, -1)) * (1.0 / math.sqrt(k.size(-1)))
+        # att = att.masked_fill(self.bias[:, :, :T, :T] == 0, float('-inf'))
+        # att = F.softmax(att, dim=-1)
+        # y = att @ v  # (B, nh, T, T) x (B, nh, T, hs) -> (B, nh, T, hs)
+        y = F.scaled_dot_product_attention(q, k, v, is_causal=True) # (B, nh, T, hs)
         y = y.transpose(1, 2).contiguous().view(B, T, C) # re-assemble all head outputs side by side
         # output projection
         y = self.c_proj(y)
         return y
+
+# class TanhGELU(nn.Module):
+#     def forward(self, input):
+#         return 0.5 * input * (1.0 + torch.tanh(math.sqrt(2.0 / math.pi) * (input + 0.044715 * torch.pow(input, 3.0))))
 
 class MLP(nn.Module):
     def __init__(self, config):
@@ -210,7 +216,7 @@ class DataLoaderLite:
         return x, y
 
 
-# -------------·------------------------------------------------------------
+# ----------------------------------------------------------
 device = 'cpu'
 if torch.cuda.is_available():
     device = 'cuda'
@@ -223,22 +229,35 @@ if torch.cuda.is_available():
     torch.cuda.manual_seed_all(1337)
 
 train_loader = DataLoaderLite(B=4, T=32)
+torch.set_float32_matmul_precision('high')
 
  # get logits
-model = GPT(GPTConfig())
+model = GPT(GPTConfig(vocab_size=50304))
 model.to(device)
+# model = torch.compile(model) cannot in mps
+
+
 # optimize:
-optimizer = torch.optim.AdamW(model.parameters(), lr=3e-4)
+optimizer = torch.optim.AdamW(model.parameters(), lr=3e-4, betas=(0.9, 0.95), eps=1e-8)
 for i in range(50):
+    t0 = time.time()
     x, y = train_loader.next_batch()
     x, y = x.to(device), y.to(device)
     optimizer.zero_grad(set_to_none=True)
-    logits, loss = model(x, y)
+    with torch.autocast(device_type=device, dtype=torch.bfloat16):
+        logits, loss = model(x, y)
     loss.backward()
+    norm = torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
     optimizer.step()
-    print(f"step {i}: loss {loss.item()}")
+    if device == "mps":
+        torch.mps.synchronize()
+    elif device == "cuda":
+        torch.cuda.synchronize()
+    t1 = time.time()
+    dt = (t1 - t0)*1000 # time difference in milliseconds
+    tokens_pre_sec = (train_loader.B * train_loader.T) / (t1 - t0)
+    print(f"step {i:4d} | loss {loss.item():.6f} | norm: {norm:.4f} | dt {dt:.2f}ms | token/sec: {tokens_pre_sec: .2f}")
 import sys; sys.exit(0)
-
 
 
 """
@@ -630,5 +649,690 @@ step 46: loss 8.224993705749512
 step 47: loss 8.29050064086914
 step 48: loss 8.226791381835938
 step 49: loss 8.209710121154785
+
+# -------------·------------------------------------------------------------
+# interaction
+device = 'cpu'
+if torch.cuda.is_available():
+    device = 'cuda'
+elif hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
+    device = 'mps'
+print(f"using device: {device}")
+
+torch.manual_seed(1337)
+if torch.cuda.is_available():
+    torch.cuda.manual_seed_all(1337)
+
+train_loader = DataLoaderLite(B=4, T=32)
+
+ # get logits
+model = GPT(GPTConfig())
+model.to(device)
+# optimize:
+optimizer = torch.optim.AdamW(model.parameters(), lr=3e-4)
+for i in range(50):
+    x, y = train_loader.next_batch()
+    x, y = x.to(device), y.to(device)
+    optimizer.zero_grad(set_to_none=True)
+    logits, loss = model(x, y)
+    import code; code.interact(local=locals())
+    loss.backward()
+    optimizer.step()
+    print(f"step {i}: loss {loss.item()}")
+import sys; sys.exit(0)
+
+Output:
+using device: mps
+loaded 338025 tokens
+1 epoch = 2640 steps
+Python 3.11.5 (main, Sep 11 2023, 08:31:25) [Clang 14.0.6 ] on darwin
+Type "help", "copyright", "credits" or "license" for more information.
+(InteractiveConsole)
+>>> logits.dtype
+torch.float32
+>>> exit()
+
+# -------------·------------------------------------------------------------
+# record time
+device = 'cpu'
+if torch.cuda.is_available():
+    device = 'cuda'
+elif hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
+    device = 'mps'
+print(f"using device: {device}")
+
+torch.manual_seed(1337)
+if torch.cuda.is_available():
+    torch.cuda.manual_seed_all(1337)
+
+train_loader = DataLoaderLite(B=4, T=32)
+
+ # get logits
+model = GPT(GPTConfig())
+model.to(device)
+# optimize:
+optimizer = torch.optim.AdamW(model.parameters(), lr=3e-4)
+for i in range(50):
+    t0 = time.time()
+    x, y = train_loader.next_batch()
+    x, y = x.to(device), y.to(device)
+    optimizer.zero_grad(set_to_none=True)
+    logits, loss = model(x, y)
+    loss.backward()
+    optimizer.step()
+    if device == "mps":
+        torch.mps.synchronize()
+    elif device == "cuda":
+        torch.cuda.synchronize()
+    t1 = time.time()
+    dt = (t1 - t0)*1000 # time difference in milliseconds
+    tokens_pre_sec = (train_loader.B * train_loader.T) / (t1 - t0)
+    print(f"step {i}: loss {loss.item()}, dt {dt:.2f}ms, token/sec: {tokens_pre_sec: .2f}")
+import sys; sys.exit(0)
+
+using device: mps
+loaded 338025 tokens
+1 epoch = 2640 steps
+step 0: loss 10.958171844482422, dt 5552.49ms, token/sec:  23.05
+step 1: loss 9.881328582763672, dt 477.04ms, token/sec:  268.32
+step 2: loss 9.107891082763672, dt 220.90ms, token/sec:  579.45
+step 3: loss 9.284090042114258, dt 212.02ms, token/sec:  603.70
+step 4: loss 8.887201309204102, dt 214.90ms, token/sec:  595.63
+step 5: loss 8.602737426757812, dt 213.76ms, token/sec:  598.81
+step 6: loss 9.011346817016602, dt 221.57ms, token/sec:  577.70
+step 7: loss 8.977106094360352, dt 211.41ms, token/sec:  605.47
+step 8: loss 8.275749206542969, dt 217.47ms, token/sec:  588.59
+step 9: loss 8.183601379394531, dt 212.21ms, token/sec:  603.18
+step 10: loss 8.497385025024414, dt 211.49ms, token/sec:  605.22
+step 11: loss 7.623585224151611, dt 214.56ms, token/sec:  596.56
+step 12: loss 7.968697547912598, dt 222.48ms, token/sec:  575.33
+step 13: loss 7.551008224487305, dt 215.98ms, token/sec:  592.64
+step 14: loss 7.676279067993164, dt 218.01ms, token/sec:  587.13
+step 15: loss 7.470975399017334, dt 218.52ms, token/sec:  585.76
+step 16: loss 7.50407075881958, dt 215.88ms, token/sec:  592.92
+step 17: loss 8.327247619628906, dt 215.86ms, token/sec:  592.98
+step 18: loss 7.2459001541137695, dt 224.71ms, token/sec:  569.63
+step 19: loss 7.915576934814453, dt 227.43ms, token/sec:  562.82
+step 20: loss 7.536590576171875, dt 214.00ms, token/sec:  598.12
+step 21: loss 7.8413214683532715, dt 214.57ms, token/sec:  596.54
+step 22: loss 6.43955659866333, dt 210.69ms, token/sec:  607.53
+step 23: loss 6.901613235473633, dt 212.87ms, token/sec:  601.31
+step 24: loss 6.835077285766602, dt 212.00ms, token/sec:  603.76
+step 25: loss 6.64145040512085, dt 210.81ms, token/sec:  607.18
+step 26: loss 6.763551712036133, dt 217.88ms, token/sec:  587.48
+step 27: loss 7.606548309326172, dt 213.43ms, token/sec:  599.74
+step 28: loss 7.159242153167725, dt 213.11ms, token/sec:  600.61
+step 29: loss 6.92185115814209, dt 208.06ms, token/sec:  615.22
+step 30: loss 7.007440567016602, dt 209.70ms, token/sec:  610.38
+step 31: loss 7.206015586853027, dt 213.50ms, token/sec:  599.53
+step 32: loss 7.086920261383057, dt 214.64ms, token/sec:  596.36
+step 33: loss 7.006921768188477, dt 211.80ms, token/sec:  604.34
+step 34: loss 7.870562553405762, dt 212.04ms, token/sec:  603.67
+step 35: loss 7.745656967163086, dt 211.89ms, token/sec:  604.10
+step 36: loss 7.675146579742432, dt 217.80ms, token/sec:  587.70
+step 37: loss 7.685906410217285, dt 213.05ms, token/sec:  600.81
+step 38: loss 8.004254341125488, dt 222.16ms, token/sec:  576.17
+step 39: loss 7.543290138244629, dt 209.74ms, token/sec:  610.27
+step 40: loss 7.414009094238281, dt 218.20ms, token/sec:  586.62
+step 41: loss 6.982158660888672, dt 212.64ms, token/sec:  601.96
+step 42: loss 7.138924598693848, dt 211.70ms, token/sec:  604.64
+step 43: loss 7.136780261993408, dt 211.25ms, token/sec:  605.93
+step 44: loss 7.006180763244629, dt 213.36ms, token/sec:  599.91
+step 45: loss 7.17011833190918, dt 216.07ms, token/sec:  592.40
+step 46: loss 6.24928617477417, dt 220.42ms, token/sec:  580.71
+step 47: loss 6.376556873321533, dt 212.49ms, token/sec:  602.38
+step 48: loss 6.959323883056641, dt 210.39ms, token/sec:  608.40
+step 49: loss 6.842306137084961, dt 216.76ms, token/sec:  590.51
+
+# -------------·------------------------------------------------------------
+device = 'cpu'
+if torch.cuda.is_available():
+    device = 'cuda'
+elif hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
+    device = 'mps'
+print(f"using device: {device}")
+
+torch.manual_seed(1337)
+if torch.cuda.is_available():
+    torch.cuda.manual_seed_all(1337)
+
+train_loader = DataLoaderLite(B=4, T=32)
+torch.set_float32_matmul_precision('high')
+
+ # get logits
+model = GPT(GPTConfig())
+model.to(device)
+# optimize:
+optimizer = torch.optim.AdamW(model.parameters(), lr=3e-4)
+for i in range(50):
+    t0 = time.time()
+    x, y = train_loader.next_batch()
+    x, y = x.to(device), y.to(device)
+    optimizer.zero_grad(set_to_none=True)
+    logits, loss = model(x, y)
+    loss.backward()
+    optimizer.step()
+    if device == "mps":
+        torch.mps.synchronize()
+    elif device == "cuda":
+        torch.cuda.synchronize()
+    t1 = time.time()
+    dt = (t1 - t0)*1000 # time difference in milliseconds
+    tokens_pre_sec = (train_loader.B * train_loader.T) / (t1 - t0)
+    print(f"step {i}: loss {loss.item()}, dt {dt:.2f}ms, token/sec: {tokens_pre_sec: .2f}")
+import sys; sys.exit(0)
+
+Output:
+using device: mps
+loaded 338025 tokens
+1 epoch = 2640 steps
+step 0: loss 10.958171844482422, dt 6449.32ms, token/sec:  19.85
+step 1: loss 9.881328582763672, dt 711.77ms, token/sec:  179.83
+step 2: loss 10.094736099243164, dt 223.26ms, token/sec:  573.34
+step 3: loss 9.937455177307129, dt 219.69ms, token/sec:  582.65
+step 4: loss 9.893423080444336, dt 223.11ms, token/sec:  573.71
+step 5: loss 9.924232482910156, dt 220.11ms, token/sec:  581.54
+step 6: loss 10.593067169189453, dt 218.39ms, token/sec:  586.12
+step 7: loss 10.743429183959961, dt 216.80ms, token/sec:  590.40
+step 8: loss 10.25972843170166, dt 232.97ms, token/sec:  549.43
+step 9: loss 9.899252891540527, dt 219.93ms, token/sec:  582.00
+step 10: loss 9.926053047180176, dt 224.20ms, token/sec:  570.93
+step 11: loss 9.431318283081055, dt 218.66ms, token/sec:  585.39
+step 12: loss 9.641067504882812, dt 216.97ms, token/sec:  589.95
+step 13: loss 9.558398246765137, dt 233.88ms, token/sec:  547.29
+step 14: loss 9.58387565612793, dt 242.02ms, token/sec:  528.88
+step 15: loss 9.670307159423828, dt 233.70ms, token/sec:  547.72
+step 16: loss 9.954623222351074, dt 235.47ms, token/sec:  543.60
+step 17: loss 10.579090118408203, dt 241.74ms, token/sec:  529.48
+step 18: loss 9.358396530151367, dt 244.07ms, token/sec:  524.45
+step 19: loss 9.18147087097168, dt 239.60ms, token/sec:  534.23
+step 20: loss 9.006113052368164, dt 250.99ms, token/sec:  509.98
+step 21: loss 9.06884479522705, dt 241.79ms, token/sec:  529.38
+step 22: loss 8.474428176879883, dt 234.76ms, token/sec:  545.24
+step 23: loss 8.566959381103516, dt 224.22ms, token/sec:  570.86
+step 24: loss 8.511438369750977, dt 228.81ms, token/sec:  559.42
+step 25: loss 8.470565795898438, dt 257.52ms, token/sec:  497.05
+step 26: loss 8.51710319519043, dt 237.12ms, token/sec:  539.80
+step 27: loss 8.652408599853516, dt 239.35ms, token/sec:  534.78
+step 28: loss 8.49587631225586, dt 240.35ms, token/sec:  532.57
+step 29: loss 8.569063186645508, dt 219.57ms, token/sec:  582.96
+step 30: loss 8.44970417022705, dt 230.21ms, token/sec:  556.01
+step 31: loss 8.607946395874023, dt 223.56ms, token/sec:  572.54
+step 32: loss 8.78038215637207, dt 222.03ms, token/sec:  576.51
+step 33: loss 8.738458633422852, dt 221.23ms, token/sec:  578.59
+step 34: loss 9.068103790283203, dt 220.74ms, token/sec:  579.87
+step 35: loss 9.021248817443848, dt 228.46ms, token/sec:  560.28
+step 36: loss 9.043392181396484, dt 228.23ms, token/sec:  560.83
+step 37: loss 9.000630378723145, dt 221.09ms, token/sec:  578.96
+step 38: loss 9.086548805236816, dt 223.37ms, token/sec:  573.05
+step 39: loss 9.039271354675293, dt 224.83ms, token/sec:  569.32
+step 40: loss 9.257287979125977, dt 230.99ms, token/sec:  554.13
+step 41: loss 8.698533058166504, dt 231.86ms, token/sec:  552.07
+step 42: loss 8.585566520690918, dt 219.05ms, token/sec:  584.35
+step 43: loss 8.554197311401367, dt 220.08ms, token/sec:  581.61
+step 44: loss 8.297456741333008, dt 231.68ms, token/sec:  552.48
+step 45: loss 8.523958206176758, dt 234.47ms, token/sec:  545.91
+step 46: loss 8.225024223327637, dt 219.03ms, token/sec:  584.40
+step 47: loss 8.290549278259277, dt 220.80ms, token/sec:  579.72
+step 48: loss 8.226852416992188, dt 228.49ms, token/sec:  560.19
+step 49: loss 8.209890365600586, dt 222.45ms, token/sec:  575.40
+
+# ----------------------------------------------------------
+device = 'cpu'
+if torch.cuda.is_available():
+    device = 'cuda'
+elif hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
+    device = 'mps'
+print(f"using device: {device}")
+
+torch.manual_seed(1337)
+if torch.cuda.is_available():
+    torch.cuda.manual_seed_all(1337)
+
+train_loader = DataLoaderLite(B=4, T=32)
+torch.set_float32_matmul_precision('high')
+
+ # get logits
+model = GPT(GPTConfig())
+model.to(device)
+# optimize:
+optimizer = torch.optim.AdamW(model.parameters(), lr=3e-4)
+for i in range(50):
+    t0 = time.time()
+    x, y = train_loader.next_batch()
+    x, y = x.to(device), y.to(device)
+    optimizer.zero_grad(set_to_none=True)
+    with torch.autocast(device_type=device, dtype=torch.float16):
+        logits, loss = model(x, y)
+        import code; code.interact(local=locals())
+    loss.backward()
+    optimizer.step()
+    if device == "mps":
+        torch.mps.synchronize()
+    elif device == "cuda":
+        torch.cuda.synchronize()
+    t1 = time.time()
+    dt = (t1 - t0)*1000 # time difference in milliseconds
+    tokens_pre_sec = (train_loader.B * train_loader.T) / (t1 - t0)
+    print(f"step {i}: loss {loss.item()}, dt {dt:.2f}ms, token/sec: {tokens_pre_sec: .2f}")
+import sys; sys.exit(0)
+
+Output:
+using device: mps
+loaded 338025 tokens
+1 epoch = 2640 steps
+Python 3.11.5 (main, Sep 11 2023, 08:31:25) [Clang 14.0.6 ] on darwin
+Type "help", "copyright", "credits" or "license" for more information.
+(InteractiveConsole)
+>>> logits.dtype
+torch.float16
+>>> model.transformer.wte
+Embedding(50257, 768)
+>>> model.transformer.wte.weight
+Parameter containing:
+tensor([[ 9.9743e-05,  1.6065e-03,  1.6118e-02,  ..., -2.3506e-02,
+         -9.5092e-03,  8.6977e-04],
+        [ 5.6103e-03, -8.9315e-04,  3.3858e-02,  ...,  1.8497e-02,
+         -1.2024e-02,  4.2558e-03],
+        [ 1.2853e-02,  8.0832e-03,  1.8367e-02,  ..., -2.2407e-02,
+         -1.2174e-02, -1.2083e-02],
+        ...,
+        [ 6.8869e-03,  1.8946e-02,  2.7229e-02,  ..., -9.2498e-03,
+         -1.6403e-02,  1.1806e-02],
+        [-6.4153e-03,  6.4614e-03, -1.8471e-02,  ...,  3.3779e-04,
+          8.5628e-03, -4.6225e-03],
+        [ 4.5271e-03, -2.1883e-02,  2.6784e-02,  ..., -4.7267e-03,
+         -1.2253e-02,  2.1918e-02]], device='mps:0', requires_grad=True)
+>>> model.transformer.wte.weight.dtype
+torch.float32
+>>> exit()
+
+# ----------------------------------------------------------
+device = 'cpu'
+if torch.cuda.is_available():
+    device = 'cuda'
+elif hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
+    device = 'mps'
+print(f"using device: {device}")
+
+torch.manual_seed(1337)
+if torch.cuda.is_available():
+    torch.cuda.manual_seed_all(1337)
+
+train_loader = DataLoaderLite(B=4, T=32)
+torch.set_float32_matmul_precision('high')
+
+ # get logits
+model = GPT(GPTConfig())
+model.to(device)
+# optimize:
+optimizer = torch.optim.AdamW(model.parameters(), lr=3e-4)
+for i in range(50):
+    t0 = time.time()
+    x, y = train_loader.next_batch()
+    x, y = x.to(device), y.to(device)
+    optimizer.zero_grad(set_to_none=True)
+    with torch.autocast(device_type=device, dtype=torch.float16):
+        logits, loss = model(x, y)
+    loss.backward()
+    optimizer.step()
+    if device == "mps":
+        torch.mps.synchronize()
+    elif device == "cuda":
+        torch.cuda.synchronize()
+    t1 = time.time()
+    dt = (t1 - t0)*1000 # time difference in milliseconds
+    tokens_pre_sec = (train_loader.B * train_loader.T) / (t1 - t0)
+    print(f"step {i}: loss {loss.item()}, dt {dt:.2f}ms, token/sec: {tokens_pre_sec: .2f}")
+import sys; sys.exit(0)
+
+Output:
+using device: mps
+loaded 338025 tokens
+1 epoch = 2640 steps
+step 0: loss 10.9581298828125, dt 4637.60ms, token/sec:  27.60
+step 1: loss 9.794281005859375, dt 541.48ms, token/sec:  236.39
+step 2: loss 9.070457458496094, dt 233.79ms, token/sec:  547.49
+step 3: loss 9.176834106445312, dt 237.00ms, token/sec:  540.09
+step 4: loss 8.82110595703125, dt 238.03ms, token/sec:  537.75
+step 5: loss 8.422988891601562, dt 239.73ms, token/sec:  533.94
+step 6: loss 8.929458618164062, dt 237.72ms, token/sec:  538.45
+step 7: loss 8.890380859375, dt 237.89ms, token/sec:  538.07
+step 8: loss 8.128128051757812, dt 238.10ms, token/sec:  537.60
+step 9: loss 8.044921875, dt 234.62ms, token/sec:  545.55
+step 10: loss 8.405509948730469, dt 230.83ms, token/sec:  554.53
+step 11: loss 7.484733581542969, dt 227.62ms, token/sec:  562.35
+step 12: loss 7.822052001953125, dt 228.18ms, token/sec:  560.95
+step 13: loss 7.4376220703125, dt 225.18ms, token/sec:  568.44
+step 14: loss 7.539520263671875, dt 237.91ms, token/sec:  538.01
+step 15: loss 7.4039154052734375, dt 228.43ms, token/sec:  560.35
+step 16: loss 7.482025146484375, dt 231.53ms, token/sec:  552.86
+step 17: loss 8.287704467773438, dt 244.08ms, token/sec:  524.43
+step 18: loss 7.1959686279296875, dt 244.40ms, token/sec:  523.73
+step 19: loss 7.879180908203125, dt 238.15ms, token/sec:  537.48
+step 20: loss 7.483558654785156, dt 237.42ms, token/sec:  539.12
+step 21: loss 7.82196044921875, dt 234.04ms, token/sec:  546.92
+step 22: loss 6.4590301513671875, dt 236.50ms, token/sec:  541.24
+step 23: loss 6.885475158691406, dt 235.28ms, token/sec:  544.04
+step 24: loss 6.8293304443359375, dt 236.87ms, token/sec:  540.38
+step 25: loss 6.7048492431640625, dt 240.23ms, token/sec:  532.82
+step 26: loss 6.8207244873046875, dt 238.42ms, token/sec:  536.87
+step 27: loss 7.6143798828125, dt 235.29ms, token/sec:  544.00
+step 28: loss 7.193733215332031, dt 223.76ms, token/sec:  572.03
+step 29: loss 6.95855712890625, dt 229.71ms, token/sec:  557.23
+step 30: loss 6.9754638671875, dt 238.58ms, token/sec:  536.51
+step 31: loss 7.216766357421875, dt 241.62ms, token/sec:  529.75
+step 32: loss 7.13336181640625, dt 252.43ms, token/sec:  507.07
+step 33: loss 7.0078277587890625, dt 253.09ms, token/sec:  505.74
+step 34: loss 7.8594207763671875, dt 233.61ms, token/sec:  547.93
+step 35: loss 7.73553466796875, dt 238.59ms, token/sec:  536.48
+step 36: loss 7.672882080078125, dt 238.86ms, token/sec:  535.87
+step 37: loss 7.6718292236328125, dt 232.67ms, token/sec:  550.14
+step 38: loss 7.967987060546875, dt 238.43ms, token/sec:  536.86
+step 39: loss 7.4837799072265625, dt 246.13ms, token/sec:  520.05
+step 40: loss 7.4139556884765625, dt 262.43ms, token/sec:  487.75
+step 41: loss 6.9335479736328125, dt 277.13ms, token/sec:  461.88
+step 42: loss 7.089820861816406, dt 262.40ms, token/sec:  487.81
+step 43: loss 7.084251403808594, dt 264.92ms, token/sec:  483.16
+step 44: loss 6.971649169921875, dt 265.91ms, token/sec:  481.36
+step 45: loss 7.075584411621094, dt 252.13ms, token/sec:  507.67
+step 46: loss 6.21185302734375, dt 273.84ms, token/sec:  467.42
+step 47: loss 6.388458251953125, dt 276.74ms, token/sec:  462.53
+step 48: loss 6.9532318115234375, dt 252.43ms, token/sec:  507.07
+step 49: loss 6.8386077880859375, dt 234.40ms, token/sec:  546.07
+
+# ----------------------------------------------------------
+# y = F.scaled_dot_product_attention(q, k, v, is_causal=True) # (B, nh, T, hs)
+# Flashattention
+device = 'cpu'
+if torch.cuda.is_available():
+    device = 'cuda'
+elif hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
+    device = 'mps'
+print(f"using device: {device}")
+
+torch.manual_seed(1337)
+if torch.cuda.is_available():
+    torch.cuda.manual_seed_all(1337)
+
+train_loader = DataLoaderLite(B=4, T=32)
+torch.set_float32_matmul_precision('high')
+
+ # get logits
+model = GPT(GPTConfig())
+model.to(device)
+# model = torch.compile(model) cannot in mps
+
+
+# optimize:
+optimizer = torch.optim.AdamW(model.parameters(), lr=3e-4)
+for i in range(50):
+    t0 = time.time()
+    x, y = train_loader.next_batch()
+    x, y = x.to(device), y.to(device)
+    optimizer.zero_grad(set_to_none=True)
+    with torch.autocast(device_type=device, dtype=torch.float16):
+        logits, loss = model(x, y)
+    loss.backward()
+    optimizer.step()
+    if device == "mps":
+        torch.mps.synchronize()
+    elif device == "cuda":
+        torch.cuda.synchronize()
+    t1 = time.time()
+    dt = (t1 - t0)*1000 # time difference in milliseconds
+    tokens_pre_sec = (train_loader.B * train_loader.T) / (t1 - t0)
+    print(f"step {i}: loss {loss.item()}, dt {dt:.2f}ms, token/sec: {tokens_pre_sec: .2f}")
+import sys; sys.exit(0)
+
+Output:
+using device: mps
+loaded 338025 tokens
+1 epoch = 2640 steps
+step 0: loss 10.95831298828125, dt 4907.62ms, token/sec:  26.08
+step 1: loss 9.794143676757812, dt 341.74ms, token/sec:  374.55
+step 2: loss 9.070182800292969, dt 232.30ms, token/sec:  551.01
+step 3: loss 9.176651000976562, dt 235.54ms, token/sec:  543.42
+step 4: loss 8.820648193359375, dt 232.41ms, token/sec:  550.75
+step 5: loss 8.422637939453125, dt 231.17ms, token/sec:  553.70
+step 6: loss 8.929595947265625, dt 226.53ms, token/sec:  565.04
+step 7: loss 8.890289306640625, dt 228.45ms, token/sec:  560.31
+step 8: loss 8.128471374511719, dt 228.02ms, token/sec:  561.35
+step 9: loss 8.044677734375, dt 229.77ms, token/sec:  557.07
+step 10: loss 8.405464172363281, dt 234.10ms, token/sec:  546.78
+step 11: loss 7.484619140625, dt 226.77ms, token/sec:  564.46
+step 12: loss 7.8219451904296875, dt 229.92ms, token/sec:  556.71
+step 13: loss 7.437469482421875, dt 229.34ms, token/sec:  558.12
+step 14: loss 7.5394134521484375, dt 230.76ms, token/sec:  554.69
+step 15: loss 7.4041595458984375, dt 230.86ms, token/sec:  554.45
+step 16: loss 7.4820556640625, dt 228.78ms, token/sec:  559.49
+step 17: loss 8.287811279296875, dt 228.06ms, token/sec:  561.27
+step 18: loss 7.19586181640625, dt 234.19ms, token/sec:  546.57
+step 19: loss 7.8791656494140625, dt 227.20ms, token/sec:  563.37
+step 20: loss 7.483421325683594, dt 229.19ms, token/sec:  558.48
+step 21: loss 7.822052001953125, dt 231.86ms, token/sec:  552.05
+step 22: loss 6.458953857421875, dt 226.37ms, token/sec:  565.45
+step 23: loss 6.885429382324219, dt 228.90ms, token/sec:  559.20
+step 24: loss 6.829231262207031, dt 234.88ms, token/sec:  544.96
+step 25: loss 6.704948425292969, dt 232.25ms, token/sec:  551.13
+step 26: loss 6.820915222167969, dt 232.52ms, token/sec:  550.50
+step 27: loss 7.614356994628906, dt 231.99ms, token/sec:  551.75
+step 28: loss 7.193473815917969, dt 229.24ms, token/sec:  558.36
+step 29: loss 6.958343505859375, dt 226.83ms, token/sec:  564.31
+step 30: loss 6.975410461425781, dt 227.95ms, token/sec:  561.52
+step 31: loss 7.2167205810546875, dt 232.04ms, token/sec:  551.63
+step 32: loss 7.13330078125, dt 227.00ms, token/sec:  563.87
+step 33: loss 7.007965087890625, dt 225.92ms, token/sec:  566.58
+step 34: loss 7.8594207763671875, dt 229.73ms, token/sec:  557.17
+step 35: loss 7.73565673828125, dt 230.96ms, token/sec:  554.21
+step 36: loss 7.6728363037109375, dt 241.03ms, token/sec:  531.05
+step 37: loss 7.672088623046875, dt 232.82ms, token/sec:  549.78
+step 38: loss 7.9680328369140625, dt 228.39ms, token/sec:  560.45
+step 39: loss 7.48394775390625, dt 228.85ms, token/sec:  559.31
+step 40: loss 7.413848876953125, dt 230.81ms, token/sec:  554.56
+step 41: loss 6.933441162109375, dt 228.65ms, token/sec:  559.81
+step 42: loss 7.0897979736328125, dt 232.26ms, token/sec:  551.10
+step 43: loss 7.084403991699219, dt 229.35ms, token/sec:  558.11
+step 44: loss 6.9716644287109375, dt 232.15ms, token/sec:  551.38
+step 45: loss 7.075569152832031, dt 226.97ms, token/sec:  563.96
+step 46: loss 6.212028503417969, dt 226.49ms, token/sec:  565.15
+step 47: loss 6.3884429931640625, dt 226.70ms, token/sec:  564.62
+step 48: loss 6.9532012939453125, dt 228.24ms, token/sec:  560.81
+step 49: loss 6.8386077880859375, dt 228.69ms, token/sec:  559.72
+
+# ----------------------------------------------------------
+device = 'cpu'
+if torch.cuda.is_available():
+    device = 'cuda'
+elif hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
+    device = 'mps'
+print(f"using device: {device}")
+
+torch.manual_seed(1337)
+if torch.cuda.is_available():
+    torch.cuda.manual_seed_all(1337)
+
+train_loader = DataLoaderLite(B=4, T=32)
+torch.set_float32_matmul_precision('high')
+
+ # get logits
+model = GPT(GPTConfig(vocab_size=50304))
+model.to(device)
+# model = torch.compile(model) cannot in mps
+
+
+# optimize:
+optimizer = torch.optim.AdamW(model.parameters(), lr=3e-4)
+for i in range(50):
+    t0 = time.time()
+    x, y = train_loader.next_batch()
+    x, y = x.to(device), y.to(device)
+    optimizer.zero_grad(set_to_none=True)
+    with torch.autocast(device_type=device, dtype=torch.float16):
+        logits, loss = model(x, y)
+    loss.backward()
+    optimizer.step()
+    if device == "mps":
+        torch.mps.synchronize()
+    elif device == "cuda":
+        torch.cuda.synchronize()
+    t1 = time.time()
+    dt = (t1 - t0)*1000 # time difference in milliseconds
+    tokens_pre_sec = (train_loader.B * train_loader.T) / (t1 - t0)
+    print(f"step {i}: loss {loss.item()}, dt {dt:.2f}ms, token/sec: {tokens_pre_sec: .2f}")
+import sys; sys.exit(0)
+
+Output:
+using device: mps
+loaded 338025 tokens
+1 epoch = 2640 steps
+step 0: loss 10.9808349609375, dt 2152.43ms, token/sec:  59.47
+step 1: loss 9.881103515625, dt 425.01ms, token/sec:  301.17
+step 2: loss 8.947944641113281, dt 240.19ms, token/sec:  532.91
+step 3: loss 9.2283935546875, dt 233.14ms, token/sec:  549.03
+step 4: loss 8.748870849609375, dt 232.01ms, token/sec:  551.70
+step 5: loss 8.445571899414062, dt 237.01ms, token/sec:  540.07
+step 6: loss 9.144989013671875, dt 236.26ms, token/sec:  541.77
+step 7: loss 8.841957092285156, dt 229.21ms, token/sec:  558.44
+step 8: loss 8.141281127929688, dt 229.41ms, token/sec:  557.94
+step 9: loss 8.099212646484375, dt 226.86ms, token/sec:  564.23
+step 10: loss 8.482528686523438, dt 227.42ms, token/sec:  562.83
+step 11: loss 7.504859924316406, dt 224.17ms, token/sec:  571.01
+step 12: loss 7.8735504150390625, dt 228.23ms, token/sec:  560.85
+step 13: loss 7.557929992675781, dt 226.72ms, token/sec:  564.59
+step 14: loss 7.582283020019531, dt 228.17ms, token/sec:  560.99
+step 15: loss 7.4419708251953125, dt 228.07ms, token/sec:  561.23
+step 16: loss 7.3779296875, dt 227.84ms, token/sec:  561.79
+step 17: loss 8.227188110351562, dt 232.38ms, token/sec:  550.82
+step 18: loss 7.2001800537109375, dt 228.85ms, token/sec:  559.32
+step 19: loss 7.8297882080078125, dt 227.28ms, token/sec:  563.19
+step 20: loss 7.46337890625, dt 227.95ms, token/sec:  561.52
+step 21: loss 7.7310333251953125, dt 226.91ms, token/sec:  564.11
+step 22: loss 6.4691619873046875, dt 228.55ms, token/sec:  560.05
+step 23: loss 6.830535888671875, dt 226.71ms, token/sec:  564.59
+step 24: loss 6.891021728515625, dt 227.02ms, token/sec:  563.83
+step 25: loss 6.699363708496094, dt 225.05ms, token/sec:  568.75
+step 26: loss 6.7591705322265625, dt 227.75ms, token/sec:  562.02
+step 27: loss 7.621551513671875, dt 226.41ms, token/sec:  565.33
+step 28: loss 7.119781494140625, dt 226.22ms, token/sec:  565.82
+step 29: loss 7.013359069824219, dt 228.09ms, token/sec:  561.19
+step 30: loss 6.96484375, dt 230.38ms, token/sec:  555.61
+step 31: loss 7.28594970703125, dt 228.34ms, token/sec:  560.58
+step 32: loss 7.1584320068359375, dt 230.85ms, token/sec:  554.47
+step 33: loss 7.059906005859375, dt 226.87ms, token/sec:  564.20
+step 34: loss 7.9029083251953125, dt 225.58ms, token/sec:  567.44
+step 35: loss 7.830780029296875, dt 227.78ms, token/sec:  561.93
+step 36: loss 7.6209716796875, dt 227.96ms, token/sec:  561.50
+step 37: loss 7.647674560546875, dt 227.00ms, token/sec:  563.87
+step 38: loss 7.9117584228515625, dt 228.93ms, token/sec:  559.13
+step 39: loss 7.4202880859375, dt 226.90ms, token/sec:  564.13
+step 40: loss 7.3924560546875, dt 226.36ms, token/sec:  565.46
+step 41: loss 6.865379333496094, dt 226.24ms, token/sec:  565.77
+step 42: loss 7.0479888916015625, dt 226.45ms, token/sec:  565.25
+step 43: loss 7.034431457519531, dt 226.55ms, token/sec:  564.99
+step 44: loss 7.0184478759765625, dt 229.68ms, token/sec:  557.29
+step 45: loss 6.9474334716796875, dt 229.17ms, token/sec:  558.55
+step 46: loss 6.129608154296875, dt 228.46ms, token/sec:  560.27
+step 47: loss 6.3230438232421875, dt 227.60ms, token/sec:  562.38
+step 48: loss 6.9045257568359375, dt 227.28ms, token/sec:  563.17
+step 49: loss 6.790611267089844, dt 229.83ms, token/sec:  556.93
+
+# ----------------------------------------------------------
+device = 'cpu'
+if torch.cuda.is_available():
+    device = 'cuda'
+elif hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
+    device = 'mps'
+print(f"using device: {device}")
+
+torch.manual_seed(1337)
+if torch.cuda.is_available():
+    torch.cuda.manual_seed_all(1337)
+
+train_loader = DataLoaderLite(B=4, T=32)
+torch.set_float32_matmul_precision('high')
+
+ # get logits
+model = GPT(GPTConfig(vocab_size=50304))
+model.to(device)
+# model = torch.compile(model) cannot in mps
+
+
+# optimize:
+optimizer = torch.optim.AdamW(model.parameters(), lr=3e-4, betas=(0.9, 0.95), eps=1e-8)
+for i in range(50):
+    t0 = time.time()
+    x, y = train_loader.next_batch()
+    x, y = x.to(device), y.to(device)
+    optimizer.zero_grad(set_to_none=True)
+    with torch.autocast(device_type=device, dtype=torch.bfloat16):
+        logits, loss = model(x, y)
+    loss.backward()
+    norm = torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+    optimizer.step()
+    if device == "mps":
+        torch.mps.synchronize()
+    elif device == "cuda":
+        torch.cuda.synchronize()
+    t1 = time.time()
+    dt = (t1 - t0)*1000 # time difference in milliseconds
+    tokens_pre_sec = (train_loader.B * train_loader.T) / (t1 - t0)
+    print(f"step {i:4d} | loss {loss.item():.6f} | norm: {norm:.4f} | dt {dt:.2f}ms | token/sec: {tokens_pre_sec: .2f}")
+import sys; sys.exit(0)
+
+Output:
+using device: mps
+loaded 338025 tokens
+1 epoch = 2640 steps
+step    0 | loss 10.978027 | norm: 15.5521 | dt 3612.99ms | token/sec:  35.43
+step    1 | loss 9.886108 | norm: 5.4822 | dt 377.10ms | token/sec:  339.43
+step    2 | loss 8.937561 | norm: 3.6732 | dt 310.39ms | token/sec:  412.38
+step    3 | loss 9.194824 | norm: 4.2398 | dt 313.36ms | token/sec:  408.48
+step    4 | loss 8.730469 | norm: 4.7621 | dt 303.85ms | token/sec:  421.26
+step    5 | loss 8.437988 | norm: 3.7637 | dt 320.04ms | token/sec:  399.95
+step    6 | loss 9.178162 | norm: 4.7727 | dt 325.82ms | token/sec:  392.85
+step    7 | loss 8.867981 | norm: 3.6167 | dt 322.26ms | token/sec:  397.20
+step    8 | loss 8.167725 | norm: 3.6700 | dt 321.63ms | token/sec:  397.97
+step    9 | loss 8.111084 | norm: 3.4665 | dt 316.49ms | token/sec:  404.44
+step   10 | loss 8.464478 | norm: 3.2132 | dt 310.60ms | token/sec:  412.11
+step   11 | loss 7.447632 | norm: 3.8311 | dt 325.26ms | token/sec:  393.53
+step   12 | loss 7.831299 | norm: 2.7233 | dt 356.50ms | token/sec:  359.05
+step   13 | loss 7.544861 | norm: 3.6002 | dt 312.30ms | token/sec:  409.86
+step   14 | loss 7.551147 | norm: 2.7389 | dt 321.77ms | token/sec:  397.80
+step   15 | loss 7.443115 | norm: 2.5372 | dt 338.56ms | token/sec:  378.07
+step   16 | loss 7.369141 | norm: 3.1235 | dt 311.41ms | token/sec:  411.03
+step   17 | loss 8.226685 | norm: 3.0291 | dt 303.02ms | token/sec:  422.42
+step   18 | loss 7.158691 | norm: 2.6071 | dt 300.17ms | token/sec:  426.43
+step   19 | loss 7.795410 | norm: 3.2330 | dt 311.88ms | token/sec:  410.41
+step   20 | loss 7.427368 | norm: 2.6131 | dt 309.75ms | token/sec:  413.23
+step   21 | loss 7.713074 | norm: 3.0221 | dt 309.79ms | token/sec:  413.18
+step   22 | loss 6.438477 | norm: 3.1037 | dt 300.17ms | token/sec:  426.42
+step   23 | loss 6.788391 | norm: 2.4885 | dt 303.62ms | token/sec:  421.59
+step   24 | loss 6.859436 | norm: 2.3492 | dt 308.93ms | token/sec:  414.33
+step   25 | loss 6.697998 | norm: 2.7277 | dt 338.80ms | token/sec:  377.80
+step   26 | loss 6.709351 | norm: 2.8913 | dt 322.09ms | token/sec:  397.41
+step   27 | loss 7.603882 | norm: 2.9657 | dt 318.53ms | token/sec:  401.85
+step   28 | loss 7.056335 | norm: 3.2891 | dt 310.53ms | token/sec:  412.20
+step   29 | loss 6.991882 | norm: 2.9656 | dt 304.40ms | token/sec:  420.50
+step   30 | loss 6.942261 | norm: 3.4492 | dt 303.88ms | token/sec:  421.22
+step   31 | loss 7.264282 | norm: 3.0961 | dt 306.82ms | token/sec:  417.18
+step   32 | loss 7.125122 | norm: 2.5841 | dt 302.84ms | token/sec:  422.67
+step   33 | loss 7.013428 | norm: 3.5710 | dt 304.38ms | token/sec:  420.52
+step   34 | loss 7.901367 | norm: 2.8137 | dt 302.06ms | token/sec:  423.75
+step   35 | loss 7.835510 | norm: 2.8414 | dt 302.42ms | token/sec:  423.26
+step   36 | loss 7.521606 | norm: 2.6813 | dt 304.25ms | token/sec:  420.70
+step   37 | loss 7.577393 | norm: 2.7950 | dt 303.32ms | token/sec:  421.99
+step   38 | loss 7.728455 | norm: 3.3209 | dt 307.24ms | token/sec:  416.61
+step   39 | loss 7.356354 | norm: 2.9148 | dt 292.81ms | token/sec:  437.14
+step   40 | loss 7.403778 | norm: 3.3171 | dt 319.74ms | token/sec:  400.33
+step   41 | loss 6.647278 | norm: 3.3172 | dt 299.40ms | token/sec:  427.52
+step   42 | loss 6.808685 | norm: 2.8572 | dt 297.20ms | token/sec:  430.68
+step   43 | loss 6.924728 | norm: 6.6540 | dt 296.81ms | token/sec:  431.25
+step   44 | loss 6.889587 | norm: 2.7048 | dt 316.10ms | token/sec:  404.94
+step   45 | loss 6.853516 | norm: 2.8369 | dt 314.80ms | token/sec:  406.61
+step   46 | loss 5.936737 | norm: 2.7971 | dt 383.79ms | token/sec:  333.51
+step   47 | loss 6.166870 | norm: 3.5953 | dt 399.34ms | token/sec:  320.53
+step   48 | loss 6.833191 | norm: 3.4541 | dt 334.32ms | token/sec:  382.87
+step   49 | loss 6.729462 | norm: 2.9496 | dt 324.92ms | token/sec:  393.94
 
 """
